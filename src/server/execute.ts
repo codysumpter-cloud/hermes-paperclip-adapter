@@ -1,11 +1,12 @@
 /**
  * Server-side execution logic for the Hermes Agent adapter.
  *
- * Spawns `hermes chat -q "..."` as a child process, streams output,
+ * Spawns `hermes chat -q "..." -Q` as a child process, streams output,
  * and returns structured results to Paperclip.
  *
  * Verified CLI flags (hermes chat):
  *   -q/--query         single query (non-interactive)
+ *   -Q/--quiet         quiet mode (no banner/spinner, only response + session_id)
  *   -m/--model         model name (e.g. anthropic/claude-sonnet-4)
  *   -t/--toolsets      comma-separated toolsets to enable
  *   --provider         inference provider (auto, openrouter, nous, etc.)
@@ -33,9 +34,6 @@ import {
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
   DEFAULT_MODEL,
-  SESSION_ID_REGEX,
-  TOKEN_USAGE_REGEX,
-  COST_REGEX,
   VALID_PROVIDERS,
 } from "../shared/constants.js";
 
@@ -62,31 +60,46 @@ function cfgStringArray(v: unknown): string[] | undefined {
 // Wake-up prompt builder
 // ---------------------------------------------------------------------------
 
-const DEFAULT_PROMPT_TEMPLATE = `You are an AI agent working as an employee in a company managed by Paperclip.
+const DEFAULT_PROMPT_TEMPLATE = `You are "{{agentName}}", an AI agent employee in a Paperclip-managed company.
 
-Your agent ID is {{agentId}} and you work for company {{companyId}}.
-Your agent name is "{{agentName}}".
+IMPORTANT: Use \`terminal\` tool with \`curl\` for ALL Paperclip API calls (web_extract and browser cannot access localhost).
+
+Your Paperclip identity:
+  Agent ID: {{agentId}}
+  Company ID: {{companyId}}
+  API Base: {{paperclipApiUrl}}
 
 {{#taskId}}
-You have been assigned a task:
-  Issue ID: {{taskId}}
-  Title: {{taskTitle}}
+## Assigned Task
 
-Instructions:
+Issue ID: {{taskId}}
+Title: {{taskTitle}}
+
 {{taskBody}}
 
-When you are done, report your results clearly. If you made code changes,
-summarize what you changed and why.
+## Workflow
+
+1. Work on the task using your tools
+2. When done, mark the issue as completed:
+   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/{{taskId}}" -H "Content-Type: application/json" -d '{"status":"done"}'\`
+3. Report what you did
 {{/taskId}}
 
 {{#noTask}}
-You have been woken by a heartbeat. Check for any pending work:
+## Heartbeat Wake — Check for Work
 
-1. Use your tools to check the current state of your project
-2. Look for any issues or improvements you can make
-3. If there is nothing to do, report that briefly
+1. List issues assigned to you:
+   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}&status=todo" | python3 -m json.tool\`
 
-API URL: {{paperclipApiUrl}}
+2. If issues found, pick the highest priority one and work on it:
+   - Checkout: \`curl -s -X POST "{{paperclipApiUrl}}/issues/ISSUE_ID/checkout" -H "Content-Type: application/json" -d '{"agentId":"{{agentId}}"}'\`
+   - Do the work
+   - Complete: \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -d '{"status":"done"}'\`
+
+3. If no issues found, check for any unassigned issues:
+   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -m json.tool\`
+
+4. If truly nothing to do, report briefly.
 {{/noTask}}`;
 
 function buildPrompt(
@@ -101,10 +114,16 @@ function buildPrompt(
   const agentName = ctx.agent?.name || "Hermes Agent";
   const companyName = cfgString(ctx.config?.companyName) || "";
   const projectName = cfgString(ctx.config?.projectName) || "";
-  const paperclipApiUrl =
+
+  // Build API URL — ensure it has the /api path
+  let paperclipApiUrl =
     cfgString(config.paperclipApiUrl) ||
     process.env.PAPERCLIP_API_URL ||
-    "http://localhost:3100/api";
+    "http://127.0.0.1:3100/api";
+  // Ensure /api suffix
+  if (!paperclipApiUrl.endsWith("/api")) {
+    paperclipApiUrl = paperclipApiUrl.replace(/\/+$/, "") + "/api";
+  }
 
   const vars: Record<string, unknown> = {
     agentId: ctx.agent?.id || "",
@@ -142,8 +161,22 @@ function buildPrompt(
 // Output parsing
 // ---------------------------------------------------------------------------
 
+/** Regex to extract session ID from Hermes quiet-mode output: "session_id: <id>" */
+const SESSION_ID_REGEX = /^session_id:\s*(\S+)/m;
+
+/** Regex for legacy session output format */
+const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
+
+/** Regex to extract token usage from Hermes output. */
+const TOKEN_USAGE_REGEX =
+  /tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:output|out)\b/i;
+
+/** Regex to extract cost from Hermes output. */
+const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
+
 interface ParsedOutput {
   sessionId?: string;
+  response?: string;
   usage?: UsageSummary;
   costUsd?: number;
   errorMessage?: string;
@@ -153,10 +186,24 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   const combined = stdout + "\n" + stderr;
   const result: ParsedOutput = {};
 
-  // Extract session ID (Hermes prints it on exit)
-  const sessionMatch = combined.match(SESSION_ID_REGEX);
+  // In quiet mode, Hermes outputs:
+  //   <response text>
+  //
+  //   session_id: <id>
+  const sessionMatch = stdout.match(SESSION_ID_REGEX);
   if (sessionMatch?.[1]) {
     result.sessionId = sessionMatch[1];
+    // The response is everything before the session_id line
+    const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
+    if (sessionLineIdx > 0) {
+      result.response = stdout.slice(0, sessionLineIdx).trim();
+    }
+  } else {
+    // Legacy format (non-quiet mode)
+    const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
+    if (legacyMatch?.[1]) {
+      result.sessionId = legacyMatch[1];
+    }
   }
 
   // Extract token usage
@@ -178,7 +225,8 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   if (stderr.trim()) {
     const errorLines = stderr
       .split("\n")
-      .filter((line) => /error|exception|traceback|failed/i.test(line));
+      .filter((line) => /error|exception|traceback|failed/i.test(line))
+      .filter((line) => !/INFO|DEBUG|warn/i.test(line)); // skip log-level noise
     if (errorLines.length > 0) {
       result.errorMessage = errorLines.slice(0, 5).join("\n");
     }
@@ -204,22 +252,20 @@ export async function execute(
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
   const extraArgs = cfgStringArray(config.extraArgs);
-  const persistSession = cfgBoolean(config.persistSession) !== false; // default true
+  const persistSession = cfgBoolean(config.persistSession) !== false;
   const worktreeMode = cfgBoolean(config.worktreeMode) === true;
-  const verbose = cfgBoolean(config.verbose) === true;
   const checkpoints = cfgBoolean(config.checkpoints) === true;
 
   // ── Build prompt ───────────────────────────────────────────────────────
   const prompt = buildPrompt(ctx, config);
 
   // ── Build command args ─────────────────────────────────────────────────
-  const args: string[] = ["chat", "-q", prompt];
+  // Use -Q (quiet) to get clean output: just response + session_id line
+  const args: string[] = ["chat", "-q", prompt, "-Q"];
 
   args.push("-m", model);
 
   // Only pass --provider if it's a valid Hermes provider choice.
-  // For models like anthropic/claude-sonnet-4, Hermes auto-detects
-  // the provider from the model name — no flag needed.
   if (provider && (VALID_PROVIDERS as readonly string[]).includes(provider)) {
     args.push("--provider", provider);
   }
@@ -228,11 +274,10 @@ export async function execute(
     args.push("-t", toolsets);
   }
 
-  if (verbose) args.push("-v");
   if (worktreeMode) args.push("-w");
   if (checkpoints) args.push("--checkpoints");
 
-  // Session resume: if we have a previous session, resume it
+  // Session resume
   const prevSessionId = cfgString(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
@@ -240,7 +285,6 @@ export async function execute(
     args.push("--resume", prevSessionId);
   }
 
-  // Extra CLI args (must be valid hermes flags)
   if (extraArgs?.length) {
     args.push(...extraArgs);
   }
@@ -251,12 +295,10 @@ export async function execute(
     ...buildPaperclipEnv(ctx.agent),
   };
 
-  // Pass Paperclip context via environment
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
   const taskId = cfgString(ctx.config?.taskId);
   if (taskId) env.PAPERCLIP_TASK_ID = taskId;
 
-  // Merge user-specified env vars
   const userEnv = config.env as Record<string, string> | undefined;
   if (userEnv && typeof userEnv === "object") {
     Object.assign(env, userEnv);
@@ -268,17 +310,13 @@ export async function execute(
   try {
     await ensureAbsoluteDirectory(cwd);
   } catch {
-    // Non-fatal: let the process start and fail with a better error
+    // Non-fatal
   }
 
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
-    `[hermes] Starting Hermes Agent (model=${model})\n`,
-  );
-  await ctx.onLog(
-    "stdout",
-    `[hermes] Command: ${hermesCmd} chat -q "..." -m ${model}\n`,
+    `[hermes] Starting Hermes Agent (model=${model}, timeout=${timeoutSec}s)\n`,
   );
   if (prevSessionId) {
     await ctx.onLog(
@@ -303,6 +341,9 @@ export async function execute(
     "stdout",
     `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
   );
+  if (parsed.sessionId) {
+    await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
+  }
 
   // ── Build result ───────────────────────────────────────────────────────
   const executionResult: AdapterExecutionResult = {
@@ -325,7 +366,12 @@ export async function execute(
     executionResult.costUsd = parsed.costUsd;
   }
 
-  // Store session ID for next run via sessionParams
+  // Summary from agent response
+  if (parsed.response) {
+    executionResult.summary = parsed.response.slice(0, 2000);
+  }
+
+  // Store session ID for next run
   if (persistSession && parsed.sessionId) {
     executionResult.sessionParams = { sessionId: parsed.sessionId };
     executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
